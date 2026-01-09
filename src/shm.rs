@@ -1,30 +1,18 @@
-use std::{fs::OpenOptions, mem, ptr};
 use memmap2::MmapMut;
-use crate::layout::*;
+use std::fs::OpenOptions;
+use std::io::Result;
+use std::mem::size_of;
 
-pub fn create_or_open() -> MmapMut {
-    let path = "/tmp/ipc_demo.shm";
-    let size = mem::size_of::<ShmLayout>();
+use crate::ipc::ShmIpc;
 
+pub fn open_shm(path: &str) -> Result<MmapMut> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .open(path)
-        .unwrap();
+        .open(path)?;
 
-    file.set_len(size as u64).unwrap();
+    file.set_len(size_of::<ShmIpc>() as u64)?;
 
-    let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
-
-    let shm = unsafe { &mut *(mmap.as_mut_ptr() as *mut ShmLayout) };
-
-    // 初始化一次
-    shm.write_pos.store(0, std::sync::atomic::Ordering::Relaxed);
-    shm.next_msg_id.store(0, std::sync::atomic::Ordering::Relaxed);
-    for c in &shm.consumer_pos {
-        c.store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    mmap
+    unsafe { MmapMut::map_mut(&file) }
 }
