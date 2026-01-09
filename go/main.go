@@ -8,11 +8,8 @@ package main
 #define RING_CAP (64*1024)
 
 typedef struct {
-    uint32_t WriteLock;
-    uint32_t State;      // 0:empty, 1:data ready, 2:reading
+    uint32_t State;      // 0: idle, 1: written, 2: reading
     uint32_t Len;
-    uint32_t Head;       // 写位置
-    uint32_t Tail;       // 读位置
     char Data[RING_CAP];
     pthread_mutex_t Mutex;
     pthread_cond_t Cond;
@@ -53,7 +50,6 @@ type Ipc struct {
 	shm *C.ShmIpc
 }
 
-// 打开共享内存
 func OpenShm(path string) (*C.ShmIpc, []byte, bool, error) {
 	firstInit := false
 	fd, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
@@ -73,7 +69,6 @@ func OpenShm(path string) (*C.ShmIpc, []byte, bool, error) {
 	}
 	fd.Close()
 
-	// 重新以共享方式打开
 	shmFd, err := syscall.Open(path, syscall.O_RDWR, 0o600)
 	if err != nil {
 		return nil, nil, false, err
@@ -93,13 +88,9 @@ func OpenShm(path string) (*C.ShmIpc, []byte, bool, error) {
 // 构造 Ipc
 func NewIpc(shm *C.ShmIpc, firstInit bool) *Ipc {
 	if firstInit {
-		// 初始化 mutex/cond 并清零状态
 		C.init_mutex_cond(shm)
-		shm.State = 0 // 0表示空，可以写
-		shm.WriteLock = 0
+		shm.State = 0
 		shm.Len = 0
-		shm.Head = 0
-		shm.Tail = 0
 	}
 	return &Ipc{shm: shm}
 }
@@ -110,12 +101,12 @@ func (ipc *Ipc) unlock()    { C.unlock(ipc.shm) }
 func (ipc *Ipc) wait()      { C.wait_cond(ipc.shm) }
 func (ipc *Ipc) broadcast() { C.broadcast(ipc.shm) }
 
-// 写消息
+// 写入消息
 func (ipc *Ipc) Write(msg []byte) {
 	ipc.lock()
 	defer ipc.unlock()
 
-	// 等待空闲状态
+	// 等待 idle 状态
 	for ipc.shm.State != 0 {
 		ipc.wait()
 	}
@@ -128,28 +119,37 @@ func (ipc *Ipc) Write(msg []byte) {
 	copy(dst, msg)
 
 	ipc.shm.Len = C.uint32_t(len(msg))
-	ipc.shm.State = 1 // 标记有数据
+	ipc.shm.State = 1 // 写完成，等待 read
 	ipc.broadcast()   // 唤醒消费者
 }
 
-// 读消息（简化的版本，实际应该使用环形缓冲区）
+// 读取消息
 func (ipc *Ipc) Read() []byte {
 	ipc.lock()
 	defer ipc.unlock()
 
-	// 等待有数据
+	// 等待 written 状态
 	for ipc.shm.State != 1 {
 		ipc.wait()
 	}
 
+	ipc.shm.State = 2 // 标记 reading
+
 	length := uint32(ipc.shm.Len)
 	data := make([]byte, length)
-	dst := (*[RING_CAP]byte)(unsafe.Pointer(&ipc.shm.Data[0]))[:length:length]
-	copy(data, dst)
+	src := (*[RING_CAP]byte)(unsafe.Pointer(&ipc.shm.Data[0]))[:length:length]
+	copy(data, src)
 
-	ipc.shm.State = 0 // 标记空闲
-	ipc.broadcast()   // 唤醒生产者
 	return data
+}
+
+// 读取完成
+func (ipc *Ipc) ReadDone() {
+	ipc.lock()
+	defer ipc.unlock()
+
+	ipc.shm.State = 0 // 回到 idle
+	ipc.broadcast()   // 唤醒生产者
 }
 
 func main() {
@@ -174,9 +174,10 @@ func main() {
 		}
 		fmt.Println("[P] Producer finished")
 	case "consumer":
-		for i := 0; i < 10; i++ {
+		for {
 			data := ipc.Read()
 			fmt.Printf("[C] Received: %s\n", string(data))
+			ipc.ReadDone()
 		}
 		fmt.Println("[C] Consumer finished")
 	default:

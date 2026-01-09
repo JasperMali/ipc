@@ -1,27 +1,27 @@
 use std::cell::UnsafeCell;
+use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::fs::OpenOptions;
+use std::os::unix::io::AsRawFd;
 
-use nix::sys::event::{
-    kevent, kqueue, EventFilter, EventFlag, FilterFlag, KEvent, Kqueue,
-};
+use libc::{c_int, pthread_cond_t, pthread_condattr_t, pthread_mutex_t, pthread_mutexattr_t};
+use libc::{PTHREAD_PROCESS_SHARED};
 
-pub const MAX_DATA: usize = 4096;
-const KEVENT_IDENT: usize = 1;
+pub const RING_CAP: usize = 64 * 1024;
 
 #[repr(C)]
 pub struct ShmIpc {
-    pub write_lock: AtomicUsize,
-    pub len: AtomicUsize,
-    pub ready: AtomicUsize,
-    pub data: UnsafeCell<[u8; MAX_DATA]>,
+    pub state: UnsafeCell<u32>,    // 0 = idle, 1 = written, 2 = reading
+    pub len: UnsafeCell<u32>,      // 消息长度
+    pub data: UnsafeCell<[u8; RING_CAP]>, // 数据
+    pub mutex: pthread_mutex_t,
+    pub cond: pthread_cond_t,
 }
 
 unsafe impl Sync for ShmIpc {}
 
 pub struct Ipc {
-    pub shm: &'static ShmIpc,
-    kq: Kqueue,
+    shm: &'static ShmIpc,
 }
 
 pub struct ZeroCopyRead<'a> {
@@ -29,102 +29,131 @@ pub struct ZeroCopyRead<'a> {
     shm: &'a ShmIpc,
 }
 
-impl<'a> Drop for ZeroCopyRead<'a> {
-    fn drop(&mut self) {
-        // 读结束，释放写权限
-        self.shm.ready.store(0, Ordering::Release);
-    }
-}
-
-
 impl Ipc {
-    pub fn new(shm: &'static ShmIpc) -> Self {
-        let kq = kqueue().expect("kqueue failed");
+    pub fn new(shm: &'static ShmIpc, first_init: bool) -> Self {
+        if first_init {
+            unsafe {
+                // 初始化 mutex
+                let mut mattr: pthread_mutexattr_t = std::mem::zeroed();
+                libc::pthread_mutexattr_init(&mut mattr);
+                libc::pthread_mutexattr_setpshared(&mut mattr, PTHREAD_PROCESS_SHARED);
+                libc::pthread_mutex_init(&mut (*(shm as *const _ as *mut ShmIpc)).mutex, &mattr);
 
-        let kev = KEvent::new(
-            KEVENT_IDENT,
-            EventFilter::EVFILT_USER,
-            EventFlag::EV_ADD | EventFlag::EV_CLEAR,
-            FilterFlag::NOTE_FFNOP,
-            0,
-            0,
-        );
+                // 初始化 cond
+                let mut cattr: pthread_condattr_t = std::mem::zeroed();
+                libc::pthread_condattr_init(&mut cattr);
+                libc::pthread_condattr_setpshared(&mut cattr, PTHREAD_PROCESS_SHARED);
+                libc::pthread_cond_init(&mut (*(shm as *const _ as *mut ShmIpc)).cond, &cattr);
 
-        kevent(&kq, &[kev], &mut [], 0).expect("kevent register");
+                // 初始化状态
+                *shm.state.get() = 0;
+                *shm.len.get() = 0;
+            }
+        }
 
-        Self { shm, kq }
+        Ipc { shm }
+    }
+
+    fn lock(&self) {
+        unsafe { libc::pthread_mutex_lock(&self.shm.mutex as *const _ as *mut _) };
+    }
+
+    fn unlock(&self) {
+        unsafe { libc::pthread_mutex_unlock(&self.shm.mutex as *const _ as *mut _) };
+    }
+
+    fn wait(&self) {
+        unsafe { libc::pthread_cond_wait(&self.shm.cond as *const _ as *mut _, &self.shm.mutex as *const _ as *mut _) };
+    }
+
+    fn broadcast(&self) {
+        unsafe { libc::pthread_cond_broadcast(&self.shm.cond as *const _ as *mut _) };
     }
 
     pub fn write(&self, buf: &[u8]) {
-        // 等 reader 消费完成
-        while self.shm.ready.load(Ordering::Acquire) != 0 {
-            std::thread::yield_now();
-        }
+        assert!(buf.len() <= RING_CAP, "message too large");
 
-        // 抢跨进程写锁
-        while self
-            .shm
-            .write_lock
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            std::thread::yield_now();
-        }
-
-        let len = buf.len().min(MAX_DATA);
-
+        self.lock();
         unsafe {
-            let ptr = (*self.shm.data.get()).as_mut_ptr();
-            slice::from_raw_parts_mut(ptr, len).copy_from_slice(&buf[..len]);
-        }
-
-        self.shm.len.store(len, Ordering::Relaxed);
-
-        self.shm.ready.store(1, Ordering::Release);
-
-        self.shm.write_lock.store(0, Ordering::Release);
-
-        let kev = KEvent::new(
-            KEVENT_IDENT,
-            EventFilter::EVFILT_USER,
-            EventFlag::empty(),
-            FilterFlag::NOTE_TRIGGER,
-            0,
-            0,
-        );
-        kevent(&self.kq, &[kev], &mut [], 0).unwrap();
-    }
-
-
-    pub fn read_blocking(&self) -> ZeroCopyRead<'_> {
-        loop {
-            let mut ev = [KEvent::new(
-                0,
-                EventFilter::EVFILT_USER,
-                EventFlag::empty(),
-                FilterFlag::empty(),
-                0,
-                0,
-            )];
-
-            kevent(&self.kq, &[], &mut ev, 0).unwrap();
-
-            if self.shm.ready.load(Ordering::Acquire) == 0 {
-                continue;
+            while *self.shm.state.get() != 0 {
+                self.wait();
             }
 
-            let len = self.shm.len.load(Ordering::Acquire);
+            ptr::copy_nonoverlapping(buf.as_ptr(), (*self.shm.data.get()).as_mut_ptr(), buf.len());
+            *self.shm.len.get() = buf.len() as u32;
+        }
+        self.unlock();
+    }
 
-            let slice = unsafe {
-                let ptr = (*self.shm.data.get()).as_ptr();
-                slice::from_raw_parts(ptr, len)
-            };
+    pub fn write_done(&self) {
+        self.lock();
+        unsafe {
+            *self.shm.state.get() = 1; // written
+            self.broadcast();
+        }
+        self.unlock();
+    }
 
-            return ZeroCopyRead {
+    pub fn read(&self) -> ZeroCopyRead<'_> {
+        self.lock();
+        unsafe {
+            while *self.shm.state.get() != 1 {
+                self.wait();
+            }
+            *self.shm.state.get() = 2; // reading
+            let len = *self.shm.len.get() as usize;
+            let slice = slice::from_raw_parts((*self.shm.data.get()).as_ptr(), len);
+            self.unlock();
+            ZeroCopyRead {
                 data: slice,
                 shm: self.shm,
-            };
+            }
         }
     }
 
+    pub fn read_done(&self) {
+        self.lock();
+        unsafe {
+            *self.shm.state.get() = 0; // idle
+            self.broadcast();
+        }
+        self.unlock();
+    }
+}
+
+/// 打开共享内存（示例用文件映射）
+pub fn open_shm(path: &str) -> (&'static mut ShmIpc, bool) {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    use libc::{ftruncate, mmap, MAP_SHARED, PROT_READ, PROT_WRITE, MAP_FAILED};
+
+    let first_init = !std::path::Path::new(path).exists();
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap();
+
+    let size = std::mem::size_of::<ShmIpc>();
+    unsafe { ftruncate(file.as_raw_fd(), size as i64) };
+
+    let ptr = unsafe {
+        mmap(
+            std::ptr::null_mut(),
+            size,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == MAP_FAILED {
+        panic!("mmap failed");
+    }
+
+    let shm = unsafe { &mut *(ptr as *mut ShmIpc) };
+    (shm, first_init)
 }

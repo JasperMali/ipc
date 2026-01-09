@@ -7,3 +7,4 @@ edition = "2024"
 memmap2 = "0.9.9"
 clap = { version = "4.5.54", features = ["derive"] }
 nix = { version = "0.30.1", features = ["event", "process"] }
+libc = "0.2.180"
